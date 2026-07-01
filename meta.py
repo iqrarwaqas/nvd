@@ -97,10 +97,12 @@ class ReptileMetaTrainer:
         self.batch = int(m.get("inner_batch", 32))
         self.rng = np.random.default_rng(seed)
 
-    def _task_batch(self, task, memory, label_space) -> WindowSet:
-        """Windows whose labels fall in task i's block, drawn from D_t u M."""
+    def _task_batch(self, task, memory, label_space, use_pool: bool = True) -> WindowSet:
+        """Windows for task i's block. The CURRENT task may use its full pool D_t;
+        PAST tasks (use_pool=False) survive only through the bounded memory M --
+        this is the continual-learning constraint that makes curation matter."""
         parts = [task.support]
-        if task.pool is not None and len(task.pool) > 0:
+        if use_pool and task.pool is not None and len(task.pool) > 0:
             parts.append(task.pool)
         mem = memory.windows_for_task(task.tid) if memory is not None else None
         if mem is not None and len(mem) > 0:
@@ -113,10 +115,12 @@ class ReptileMetaTrainer:
         t = len(seen_tasks)
         adapted: list[dict] = []
 
+        current = seen_tasks[-1]
         for task in seen_tasks:
             self.model.load_state_dict(_merge(self.model.state_dict(), phi_base))
             cols = label_space.task_columns(task.key)
-            data = self._task_batch(task, memory, label_space)
+            # only the current task sees its full pool; past tasks rely on memory M
+            data = self._task_batch(task, memory, label_space, use_pool=(task is current))
             for _ in range(self.epochs):
                 inner_adapt(self.model, data, cols, steps=self.r, lr=self.alpha,
                             batch=self.batch, device=self.device, rng=self.rng)
