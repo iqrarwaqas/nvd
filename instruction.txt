@@ -47,7 +47,23 @@ Install deps once:
              reptile_reservoir, reptile_gss, proposed
 
 ------------------------------------------------------------------------------
- 4. EVALUATE + NATIVE CARE SCORE
+ 4. TRAIN, SAVE, THEN EVALUATE THE SAVED MODEL  (recommended workflow)
+------------------------------------------------------------------------------
+    # (a) train -- this SAVES the trained model + replay memory into a run folder
+    python main.py train --method proposed
+
+    # the checkpoint path is printed, e.g.:
+    #   [checkpoint] model saved to results/runs/<timestamp>__train__proposed__seed0/model.pt
+
+    # (b) evaluate that saved model -- loads model.pt, NO retraining:
+    python main.py eval --checkpoint results/runs/<timestamp>__train__proposed__seed0
+
+    # (Windows path with spaces? wrap it in quotes.)
+    # Note: forgetting is reported as NaN here -- it needs the full training curve,
+    #       which lives in the train run's summary.json, not the checkpoint.
+
+------------------------------------------------------------------------------
+ 5. QUICK EVALUATE (train + eval in one pass, no checkpoint)
 ------------------------------------------------------------------------------
     python main.py eval --method proposed
 

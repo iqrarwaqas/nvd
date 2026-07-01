@@ -292,8 +292,13 @@ class EWC:
 # ===========================================================================
 # The incremental continual-learning loop (the heart of the pipeline)
 # ===========================================================================
-def run_incremental(cfg: dict, seed: int, method: str, small: bool = False) -> dict:
+def run_incremental(cfg: dict, seed: int, method: str, small: bool = False,
+                    return_state: bool = False):
     """Run one A->B->C incremental pass for ``method`` and return its scoreboard.
+
+    If ``return_state`` is set, returns ``(scoreboard, state)`` where ``state``
+    holds the trained ``model``, replay ``buffer``, ``label_space`` and
+    ``curriculum`` -- used by ``train`` to save a checkpoint for later ``eval``.
 
     Steps per task t (PIPELINE.md §5-§7):
       1. Grow the head to reveal task t's block (old columns preserved).
@@ -413,6 +418,11 @@ def run_incremental(cfg: dict, seed: int, method: str, small: bool = False) -> d
     # native CARE score in binary detection mode (real data only)
     if cfg["eval"].get("report_care_score", True) and not synthetic:
         scoreboard["care"] = compute_care_score(model, cur, cfg, device)
+
+    if return_state:
+        return scoreboard, {"model": model, "buffer": buffer,
+                            "label_space": ls, "curriculum": cur,
+                            "synthetic": synthetic}
     return scoreboard
 
 
@@ -724,6 +734,102 @@ def save_group_summary(cfg: dict, command: str, label: str, runs: list[dict], ts
 
 
 # ===========================================================================
+# Model checkpointing (train -> save; eval -> load, no retraining)
+# ---------------------------------------------------------------------------
+# A checkpoint captures everything needed to reproduce task-aware evaluation:
+#   model.pt   - backbone weights (grown to the final head width)
+#   memory.npz - the replay buffer (needed for eq-5 task-aware adaptation)
+#   ckpt.json  - method, seed, config snapshot, backbone dims, curriculum keys
+# The query sets are rebuilt deterministically from (config, seed), so they are
+# not stored -- only what training produced that eval cannot recompute.
+# ===========================================================================
+def save_checkpoint(run_dir: str, state: dict, cfg: dict, method: str, seed: int):
+    model, buffer, ls, cur = (state["model"], state["buffer"],
+                              state["label_space"], state["curriculum"])
+    torch.save(model.state_dict(), os.path.join(run_dir, "model.pt"))
+    if buffer is not None and len(buffer):
+        ws = buffer.as_windowset()
+        np.savez(os.path.join(run_dir, "memory.npz"),
+                 X=ws.X, mask=ws.mask, y=ws.y, task=ws.task,
+                 farm=np.array(ws.farm, dtype=object))
+    ckpt = {
+        "method": method, "seed": seed, "synthetic": state.get("synthetic"),
+        "n_channels": cur.n_channels, "window": cur.n_timesteps,
+        "total_classes": ls.total_classes, "budget_B": int(cfg["memory"]["budget_B"]),
+        "has_memory": bool(buffer is not None and len(buffer)),
+        "tasks": [{"tid": t.tid, "key": t.key} for t in cur],
+    }
+    with open(os.path.join(run_dir, "ckpt.json"), "w", encoding="utf-8") as f:
+        json.dump(ckpt, f, indent=2)
+    print(f"[checkpoint] model saved to {os.path.relpath(run_dir, HERE)}/model.pt")
+
+
+def evaluate_checkpoint(cfg: dict, ckpt_dir: str, small: bool = False) -> dict:
+    """Load a trained checkpoint and run ONLY task-aware evaluation + CARE score
+    (no training). The curriculum is rebuilt deterministically from (config,seed)
+    so query sets match those the model was trained/evaluated on."""
+    with open(os.path.join(ckpt_dir, "ckpt.json"), "r", encoding="utf-8") as f:
+        ckpt = json.load(f)
+    method, seed = ckpt["method"], ckpt["seed"]
+    device = resolve_device(cfg)
+    set_seed(seed)
+
+    cur, synthetic = build_curriculum(cfg, seed, small=small)
+    ls = cur.label_space
+
+    # rebuild the model at the final (grown) width and load the trained weights
+    model = CNNLSTMBackbone(
+        n_channels=cur.n_channels,
+        conv_channels=tuple(cfg["backbone"]["conv_channels"]),
+        kernel=int(cfg["backbone"]["kernel"]),
+        lstm_hidden=int(cfg["backbone"]["lstm_hidden"]),
+        lstm_layers=int(cfg["backbone"]["lstm_layers"]),
+        dropout=float(cfg["backbone"]["dropout"]),
+        n_classes=ls.total_classes,
+    ).to(device)
+    model.load_state_dict(torch.load(os.path.join(ckpt_dir, "model.pt"),
+                                     map_location=device))
+
+    # restore the replay memory (needed for eq-5 adaptation)
+    buffer = None
+    mem_path = os.path.join(ckpt_dir, "memory.npz")
+    if ckpt.get("has_memory") and os.path.exists(mem_path):
+        z = np.load(mem_path, allow_pickle=True)
+        buffer = ReplayBuffer(int(ckpt["budget_B"]))
+        buffer.set_contents(dl.WindowSet(z["X"], z["mask"], z["y"], z["task"],
+                                         list(z["farm"])))
+
+    # task-aware evaluation across all tasks (final row of the accuracy matrix)
+    R = {}
+    task_ids = [t.tid for t in cur]
+    last = task_ids[-1]
+    R[last] = {}
+    for t in cur:
+        R[last][t.tid] = task_aware_eval(model, t, buffer, ls, cfg, device,
+                                         seed=seed, adapt=(buffer is not None))["acc"]
+
+    scoreboard = {
+        "method": method, "seed": seed, "synthetic": synthetic,
+        "n_tasks": len(cur), "total_classes": ls.total_classes, "device": device,
+        "loaded_from": os.path.relpath(ckpt_dir, HERE),
+        "avg_incremental_accuracy": float(np.mean(list(R[last].values()))),
+        "avg_forgetting": float("nan"),   # forgetting needs the full training curve
+        "harmonic_mean_base_novel": metrics.harmonic_mean_base_novel(R, task_ids),
+        "final_avg_accuracy": float(np.mean(list(R[last].values()))),
+        "tasks": [{"tid": t.tid, "key": t.key, "farm": t.farm, "U": t.U,
+                   "local_classes": t.local_classes, "n_support": len(t.support),
+                   "n_query": len(t.query), "n_pool": len(t.pool)} for t in cur],
+        "accuracy_matrix": {str(last): {str(j): v for j, v in R[last].items()}},
+        "per_task": [{"tid": t.tid, "key": t.key,
+                      "acc_after_learning": None, "acc_final": R[last][t.tid],
+                      "forgetting": None} for t in cur],
+    }
+    if cfg["eval"].get("report_care_score", True) and not synthetic:
+        scoreboard["care"] = compute_care_score(model, cur, cfg, device)
+    return scoreboard
+
+
+# ===========================================================================
 # CLI commands
 # ===========================================================================
 def cmd_selftest(args, cfg):
@@ -757,8 +863,10 @@ def cmd_train(args, cfg):
     ts = timestamp()
     runs = []
     for s in seeds:
-        r = run_incremental(cfg, seed=s, method=method, small=args.small)
-        save_experiment(cfg, "train", r, ts)         # one folder per seed
+        r, state = run_incremental(cfg, seed=s, method=method, small=args.small,
+                                   return_state=True)
+        run_dir = save_experiment(cfg, "train", r, ts)   # one folder per seed
+        save_checkpoint(run_dir, state, cfg, method, s)  # + trained model for later eval
         runs.append(r)
     for r in runs:
         print(f"  seed {r['seed']}: inc_acc={r['avg_incremental_accuracy']:.3f} "
@@ -773,9 +881,20 @@ def cmd_train(args, cfg):
 
 
 def cmd_eval(args, cfg):
-    """Evaluate a method and report the native CARE score (real data only)."""
-    method = args.method or "proposed"
-    r = run_incremental(cfg, seed=cfg["seed"], method=method, small=args.small)
+    """Evaluate a trained model. With --checkpoint, load a saved model and only
+    run task-aware eval + CARE (no retraining); otherwise train-then-eval in one
+    pass (convenience)."""
+    if args.checkpoint:
+        ckpt_dir = args.checkpoint if os.path.isabs(args.checkpoint) \
+            else os.path.join(HERE, args.checkpoint)
+        if not os.path.isfile(os.path.join(ckpt_dir, "ckpt.json")):
+            print(f"[error] no checkpoint (ckpt.json) found in {ckpt_dir!r}")
+            return 1
+        print(f">>> evaluating checkpoint: {ckpt_dir}")
+        r = evaluate_checkpoint(cfg, ckpt_dir, small=args.small)
+    else:
+        method = args.method or "proposed"
+        r = run_incremental(cfg, seed=cfg["seed"], method=method, small=args.small)
     print_scoreboard([r])
     if isinstance(r.get("care"), dict):
         print("\nCARE sub-scores:")
@@ -800,8 +919,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--all-seeds", action="store_true", help="run over eval.seeds")
     t.add_argument("--small", action="store_true", help="use the small/fast subset")
 
-    e = sub.add_parser("eval", help="evaluate a method + native CARE score")
-    e.add_argument("--method", default=None, choices=list(METHOD_PRESETS))
+    e = sub.add_parser("eval", help="evaluate a trained model + native CARE score")
+    e.add_argument("--checkpoint", default=None,
+                   help="path to a saved train run folder (contains model.pt/ckpt.json); "
+                        "loads the trained model instead of retraining")
+    e.add_argument("--method", default=None, choices=list(METHOD_PRESETS),
+                   help="method to train-then-eval when --checkpoint is not given")
     e.add_argument("--small", action="store_true")
     return p
 
