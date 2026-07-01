@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Keep the results schema doc; ignore actual run outputs.
+results/*
+!results/README.md

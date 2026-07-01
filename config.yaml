@@ -1,0 +1,76 @@
+# =============================================================================
+# CARE-IFD default configuration.
+# All hyperparameters + the dataset path live here so one command reproduces a run.
+# See PIPELINE.md for the design brief this file mirrors.
+# =============================================================================
+
+seed: 0
+
+data:
+  root: "../Datasets/Care"        # contains "Wind Farm A", "Wind Farm B", "Wind Farm C"
+  sep: ";"                        # CARE CSVs are semicolon-separated
+  window: 144                     # 24h at 10-min resolution
+  stride: 6                       # 1h hop; tune vs class balance
+  farms: [A, B, C]
+  zero_mask: true                 # farms B,C encode missing as 0 -> mask, do NOT feed as real
+  zero_run_min: 6                 # a run of >= this many consecutive all-zero rows is "missing"
+  standardize: per_channel_per_farm
+  lazy: true                      # stream CSVs, never load all farms into RAM
+  max_datasets_per_farm: null     # null = use all; set an int (e.g. 4) for quick real-data runs
+  # status_type_id values that count as normal operation (README: 0=Normal, 2=Idling).
+  normal_status_ids: [0, 2]
+  # Cross-farm channel handling: "shared" aligns farms to a common signal subset;
+  # "farm_max" pads to the widest farm and zero-masks unused channels.
+  channel_mode: shared
+
+task:
+  granularity: farm_x_faultgroup  # {farm | farm_x_faultgroup | turbine}
+  shots_K: 5                      # sweep {1,5,10}
+  order: fixed                    # fixed | resampled (resampled for RL training)
+  protocol: incremental_farms     # incremental_farms | leave_one_event_out
+
+backbone:
+  conv_channels: [64, 64, 128]
+  kernel: 5
+  lstm_hidden: 128
+  lstm_layers: 1
+  dropout: 0.2
+
+meta:
+  update_rule: reptile_canonical  # reptile_canonical | paper_eq4_avg
+  inner_steps_r: 5
+  inner_lr_alpha: 1.0e-3
+  meta_step_eps: 0.1              # eps in canonical Reptile meta-update
+  beta: 2.0                       # meta-step decay (paper eq 4)
+  base_task_epochs: 30
+  inner_batch: 32
+  steps_per_epoch: 50             # mini-batch updates per epoch for the baseline learners
+
+memory:
+  budget_B: 200
+  strategy: rl                    # random | herding | reservoir | gss | rl
+  candidate_pool_cap: 512         # max labelled pool windows offered to curation per task
+  rl:
+    reward_alpha: 0.5             # alpha_r in eq (7): old vs new accuracy weight
+    reward_lambda: 0.1            # occupancy penalty
+    reward_max_query: 512         # cap query windows per reward eval (keeps episodes fast)
+    bc_warmstart_from: herding
+    episodes: 400
+    baseline: moving_avg          # variance reduction for REINFORCE
+    fallback: bandit              # bandit | none
+    policy_hidden: 64
+    policy_lr: 1.0e-3
+    bandit_epsilon: 0.1
+
+eval:
+  seeds: [0, 1, 2]
+  report_care_score: true
+  batch: 256                      # inference batch size (bounds GPU memory on large query sets)
+  beta: 0.5                       # F-beta for coverage/reliability (precision-weighted)
+  criticality_threshold: 72       # 12h of consecutive 10-min anomalies for event detection
+  # PIPELINE.md §8: omega = (1,1,1,0). Accuracy is a GATE, NOT a weighted term.
+  care_weights: {coverage: 1.0, earliness: 1.0, reliability: 1.0}
+  accuracy_gate: 0.5              # datasets with normal-accuracy below this fail the gate
+
+paths:
+  results_dir: "results"

@@ -1,0 +1,92 @@
+==============================================================================
+ CARE-IFD -- HOW TO RUN
+==============================================================================
+RL-guided incremental fault diagnosis for wind turbines on the CARE benchmark.
+Everything runs through main.py. Dataset must be at ../Datasets/Care relative to
+main.py (resolves to d:\Repo\Datasets\Care). If absent, runs fall back to a
+synthetic curriculum and say so.
+
+Install deps once:
+    pip install -r requirements.txt
+
+------------------------------------------------------------------------------
+ 0. SANITY CHECK (seconds; no data or GPU needed)
+------------------------------------------------------------------------------
+    python main.py selftest
+
+------------------------------------------------------------------------------
+ 1. QUICK SMOKE TEST (small subset, real data) -- do this first
+------------------------------------------------------------------------------
+    python main.py train --method proposed --small
+
+    --small shrinks the task list / work per task so you can time a real-data
+    pass before committing to the full run.
+
+------------------------------------------------------------------------------
+ 2. TRAIN THE PROPOSED METHOD (RL-curated memory)
+------------------------------------------------------------------------------
+    python main.py train --method proposed              # single seed (config seed=0)
+    python main.py train --method proposed --all-seeds  # eval.seeds -> mean +/- std
+
+------------------------------------------------------------------------------
+ 3. TRAIN / COMPARE BASELINES
+------------------------------------------------------------------------------
+    python main.py baselines                            # whole Table I + II ladder
+
+    # or one method at a time (any preset):
+    python main.py train --method fine_tuning
+    python main.py train --method ewc
+    python main.py train --method icarl
+    python main.py train --method reptile_random
+    python main.py train --method reptile_herding
+    python main.py train --method reptile_reservoir
+    python main.py train --method reptile_gss
+    python main.py train --method proposed
+
+    Presets: fine_tuning, ewc, icarl, reptile_random, reptile_herding,
+             reptile_reservoir, reptile_gss, proposed
+
+------------------------------------------------------------------------------
+ 4. EVALUATE + NATIVE CARE SCORE
+------------------------------------------------------------------------------
+    python main.py eval --method proposed
+
+------------------------------------------------------------------------------
+ CONFIG (edit config.yaml, or copy it and pass --config myconfig.yaml)
+------------------------------------------------------------------------------
+    --config PATH .................. use a different config file
+    Key knobs:
+      data.root .................... dataset location
+      data.normal_status_ids ....... status ids treated as normal (default [0,2])
+      task.granularity ............. farm | farm_x_faultgroup | turbine
+      task.shots_K ................. few-shot budget (sweep {1,5,10})
+      task.protocol ................ incremental_farms | leave_one_event_out
+      memory.strategy .............. random | herding | reservoir | gss | rl
+      memory.budget_B .............. replay buffer capacity (same for all methods)
+      meta.update_rule ............. reptile_canonical | paper_eq4_avg
+      meta.base_task_epochs ........ epochs per task
+      memory.rl.episodes ........... REINFORCE episodes for the RL policy
+      eval.seeds ................... seeds used by --all-seeds
+
+    GPU is used automatically if available, else CPU. To force CPU, add:
+      train:
+        device: cpu
+
+------------------------------------------------------------------------------
+ WHERE RESULTS GO  (see results/README.md for the full schema)
+------------------------------------------------------------------------------
+    results/
+      INDEX.md ..................... master table, one row per run (read this first)
+      index.jsonl .................. same, one JSON line per run (machine-readable)
+      runs/<timestamp>__<command>__<method>__seed<seed>/
+          summary.json ............. everything: metrics, CARE, full learning
+                                     curve (accuracy_matrix), per-task breakdown,
+                                     curriculum, environment
+          insights.md .............. human-readable narrative of that single run
+          config.snapshot.yaml ..... exact config that produced the run
+      runs/<timestamp>__<command>__<label>__AGGREGATE.json
+                                     mean +/- std across seeds / methods
+
+    To review results later (even in a fresh session): open results/INDEX.md for
+    the overview, then the relevant runs/<run_id>/insights.md or summary.json.
+==============================================================================
